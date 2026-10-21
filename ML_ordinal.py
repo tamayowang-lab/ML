@@ -18,9 +18,10 @@ One model for all three stages instead of pairwise comparisons:
     all fitted on training data only (same logic as sleep_stage_classification.py).
   * Tuning criterion: Spearman correlation between the latent score and the stage.
 """
+
 import numpy as np
 import pandas as pd
-from joblib import delayed
+from joblib import Parallel, delayed
 from tqdm import tqdm
 import os
 import re
@@ -35,6 +36,10 @@ from scipy.stats import spearmanr
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import roc_auc_score, balanced_accuracy_score
 from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import RFE
+from sklearn.linear_model import LogisticRegression
 
 # ----------------------------------------------------------------------------
 def channel_region(name):
@@ -60,7 +65,130 @@ def build_region_index(names):
         regions.setdefault(r, []).append(i)
     return {r: np.array(regions[r]) for r in sorted(regions)}
 
+def make_lr(seed, c=1.0):
+    return LogisticRegression(solver='liblinear', max_iter=2000, C=c,
+                              class_weight='balanced', random_state=seed)
 
+
+def zscore_within_subject(df, feat_cols):
+    g = df.groupby('original_id')[feat_cols]
+    out = df.copy()
+    out[feat_cols] = (df[feat_cols] - g.transform('mean')) / g.transform('std').replace(0, np.nan)
+    return out
+
+
+def make_pair(df, feat_cols, a, b, cap, seed):
+    d = df[df['stage'].isin([a, b])]
+    if cap:
+        parts = [g.sample(min(len(g), cap), random_state=seed)
+                 for _, g in d.groupby(['original_id', 'stage'])]
+        d = pd.concat(parts)
+    d = d.reset_index(drop=True)
+    return (d[feat_cols].values, (d['stage'] == b).astype(int).values,
+            d['original_id'].values)
+
+
+def impute_scale(x_fit, x_apply):
+    """Fit imputation and scaling on x_fit only, then transform both arrays."""
+    imp = SimpleImputer(strategy='mean').fit(x_fit)
+    x_fit = imp.transform(x_fit)
+    sc = StandardScaler().fit(x_fit)
+    return sc.transform(x_fit), sc.transform(imp.transform(x_apply))
+
+
+def rfe_rank(x, y, seed):
+    """Full RFE ranking in one pass (1 = most important). The top n features are rank <= n."""
+    return RFE(make_lr(seed), n_features_to_select=1, step=1).fit(x, y).ranking_
+
+
+def run_fold(tr, te, x, y, groups, feat_cols, seed, inner_folds):
+    n_feat = x.shape[1]
+    n_grid = sorted({k for k in (2, 3, 4, 6, 8, 12, 16, 20, 25) if k < n_feat} | {n_feat})
+    x_tr_all, y_tr_all, g_tr_all = x[tr], y[tr], groups[tr]
+
+    # Inner CV: one RFE ranking per inner fold, reused for every n and every C
+    inner = StratifiedGroupKFold(inner_folds, shuffle=True, random_state=seed)
+    scores = np.full((inner_folds, len(n_grid), len(c_grid)), np.nan)
+    for k, (ia, ib) in enumerate(inner.split(x_tr_all, y_tr_all, g_tr_all)):
+        ya, yb = y_tr_all[ia], y_tr_all[ib]
+        if len(np.unique(yb)) < 2:
+            continue                                # AUC undefined for this inner fold
+        xa, xb = impute_scale(x_tr_all[ia], x_tr_all[ib])
+        rank = rfe_rank(xa, ya, seed)
+        for i, n in enumerate(n_grid):
+            cols = rank <= n
+            for j, c in enumerate(c_grid):
+                clf = make_lr(seed, c).fit(xa[:, cols], ya)
+                scores[k, i, j] = roc_auc_score(yb, clf.predict_proba(xb[:, cols])[:, 1])
+
+    mean_scores = np.nanmean(scores, axis=0)
+    i, j = np.unravel_index(np.nanargmax(mean_scores), mean_scores.shape)
+    best_n, best_c = n_grid[i], c_grid[j]
+
+    # Final model on all outer-training data
+    x_tr, x_te = impute_scale(x_tr_all, x[te])
+    cols = rfe_rank(x_tr, y_tr_all, seed) <= best_n
+    clf = make_lr(seed, best_c).fit(x_tr[:, cols], y_tr_all)
+
+    prob = clf.predict_proba(x_te[:, cols])[:, 1]
+    pred = clf.predict(x_te[:, cols])
+    return dict(
+        te=te, prob=prob, pred=pred,
+        auc=roc_auc_score(y[te], prob) if len(np.unique(y[te])) == 2 else np.nan,
+        ba=balanced_accuracy_score(y[te], pred),
+        features=list(np.array(feat_cols)[cols]),
+        coefs=list(clf.coef_[0]),
+        n_feat=int(cols.sum()), c=best_c,
+    )
+
+
+def run_jobs(jobs, n_jobs, bar):
+    """Run the delayed fold jobs on one or several cores, updating the progress bar per fold."""
+    results = []
+    if n_jobs == 1:
+        for func, args, kwargs in jobs:
+            results.append(func(*args, **kwargs))
+            bar.update(1)
+    else:       # Needs joblib >= 1.3
+        for res in Parallel(n_jobs=n_jobs, return_as='generator_unordered')(jobs):
+            results.append(res)
+            bar.update(1)
+    return results
+
+
+def nested_cv(x, y, groups, feat_cols, s, bar):
+    per_auc, per_ba, pooled_auc, pooled_ba = [], [], [], []
+    feature_hits, n_sel, cs = {}, [], []
+    n_folds_total = 0
+
+    for r in range(s['repeats']):
+        seed = s['seed'] + r
+        outer = StratifiedGroupKFold(s['outer_folds'], shuffle=True, random_state=seed)
+        jobs = [delayed(run_fold)(tr, te, x, y, groups, feat_cols, seed, s['inner_folds'])
+                for tr, te in outer.split(x, y, groups)]
+        res = run_jobs(jobs, s['n_jobs'], bar)
+
+        oof_p, oof_pred = np.full(len(y), np.nan), np.full(len(y), -1)
+        for d in res:
+            oof_p[d['te']], oof_pred[d['te']] = d['prob'], d['pred']
+            for f in d['features']:
+                feature_hits[f] = feature_hits.get(f, 0) + 1
+            n_sel.append(d['n_feat'])
+            cs.append(d['c'])
+            n_folds_total += 1
+
+        per_auc.append(np.nanmean([d['auc'] for d in res]))
+        per_ba.append(np.mean([d['ba'] for d in res]))
+        pooled_auc.append(roc_auc_score(y, oof_p))
+        pooled_ba.append(balanced_accuracy_score(y, oof_pred))
+
+    stab = (pd.Series(feature_hits, dtype=float) / n_folds_total).sort_values(ascending=False)
+    return dict(per_repeat_fold_mean_auc=per_auc, per_repeat_fold_mean_ba=per_ba,
+                per_repeat_pooled_auc=pooled_auc, per_repeat_pooled_ba=pooled_ba,
+                feature_selection_frequency=stab,
+                median_n_features=float(np.median(n_sel)), median_c=float(np.median(cs)))
+
+#%%
 load_folder = r'D:\Sleep_data\Preprocessing\Clean_final'
 file_names = [f for f in os.listdir(load_folder) if f.endswith('raw.fif')]
 file_names.sort()
@@ -197,7 +325,7 @@ data_dfa = pd.concat(frames, ignore_index=True)
 
 print(data_dfa.groupby(['stage']).size())
 print(data_dfa.groupby(['original_id', 'stage']).size().unstack())
-data_dfa.to_csv('sampen_features_epochs.csv', index=False)
+data_dfa.to_csv('dfa_features_epochs.csv', index=False)
 print('Saved dfa_epochs.csv', data_dfa.shape)
 
 #%% fooof
@@ -452,7 +580,10 @@ def summarise(fold_results, feat_cols):
 
 
 s = settings
-
+feat_cols = [c for c in data.columns if c.startswith('SampEn_')]
+if s['zscore_within_subject']:
+    data = zscore_within_subject(data, feat_cols)
+    
 data = data[data['stage'].isin(stage_order)]
 feat_cols = [c for c in data.columns if c.startswith('SampEn_')]
 if s['zscore_within_subject']:
