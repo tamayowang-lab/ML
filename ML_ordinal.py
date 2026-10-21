@@ -41,7 +41,174 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import RFE
 from sklearn.linear_model import LogisticRegression
 
-# ----------------------------------------------------------------------------
+class OrdinalLogit:
+    """Proportional-odds logistic regression with an L2 penalty.
+
+    Objective: mean weighted negative log-likelihood + ||w||^2 / (2 * c * n),
+    so c has the same meaning as C in sklearn's LogisticRegression.
+    """
+
+    def __init__(self, c=1.0, max_iter=500):
+        self.c = c
+        self.max_iter = max_iter
+
+    @staticmethod
+    def _unpack(params, p):
+        # Thresholds are kept increasing: theta_0 = a0, theta_k = theta_(k-1) + exp(d_k)
+        w, a0, d = params[:p], params[p], params[p + 1:]
+        return w, np.cumsum(np.concatenate([[a0], np.exp(d)]))
+
+    def _objective(self, params, x, y, s):
+        n, p = x.shape
+        w, theta = self._unpack(params, p)
+        d = params[p + 1:]
+        idx = np.arange(n)
+
+        f = expit(theta[None, :] - (x @ w)[:, None])                  # n x (K-1), F_k
+        fcum = np.hstack([np.zeros((n, 1)), f, np.ones((n, 1))])      # Columns: F_-1 ... F_(K-1)
+        prob = np.clip(fcum[idx, y + 1] - fcum[idx, y], 1e-12, None)  # P(y) = F_y - F_(y-1)
+
+        value = -np.mean(s * np.log(prob)) + w @ w / (2 * self.c * n)
+
+        g = f * (1 - f)                                               # dF_k / dtheta_k
+        gcum = np.hstack([np.zeros((n, 1)), g, np.zeros((n, 1))])
+        r = s / (prob * n)
+        grad_w = x.T @ (r * (gcum[idx, y + 1] - gcum[idx, y])) + w / (self.c * n)
+
+        k = f.shape[1]
+        grad_theta = np.array([-(np.sum(r[y == j] * g[y == j, j])
+                                 - np.sum(r[y == j + 1] * g[y == j + 1, j])) for j in range(k)])
+        rev = np.cumsum(grad_theta[::-1])[::-1]                       # rev[j] = sum of grad_theta[k >= j]
+        grad = np.concatenate([grad_w, [rev[0]], np.exp(d) * rev[1:]])
+        return value, grad
+
+    def fit(self, x, y, sample_weight=None):
+        self.classes_ = np.unique(y)
+        y = np.searchsorted(self.classes_, y)
+        n, p = x.shape
+        k = len(self.classes_)
+        s = np.ones(n) if sample_weight is None else sample_weight * n / np.sum(sample_weight)
+
+        # Start from the (weighted) class proportions
+        props = np.array([s[y == j].sum() for j in range(k)]) / s.sum()
+        cum = np.clip(np.cumsum(props)[:-1], 1e-3, 1 - 1e-3)
+        theta0 = np.log(cum / (1 - cum))
+        init = np.concatenate([np.zeros(p), [theta0[0]],
+                               np.log(np.clip(np.diff(theta0), 1e-3, None))])
+
+        res = minimize(self._objective, init, args=(x, y, s), jac=True,
+                       method='L-BFGS-B', options={'maxiter': self.max_iter})
+        self.coef_, self.theta_ = self._unpack(res.x, p)
+        return self
+
+    def decision_function(self, x):
+        return x @ self.coef_
+
+    def predict_proba(self, x):
+        f = expit(self.theta_[None, :] - self.decision_function(x)[:, None])
+        n = len(f)
+        return np.diff(np.hstack([np.zeros((n, 1)), f, np.ones((n, 1))]), axis=1)
+
+    def predict(self, x):
+        return self.classes_[np.argmax(self.predict_proba(x), axis=1)]
+
+
+def make_set(df, feat_cols, cap, seed):
+    d = df[df['stage'].isin(stage_order)]
+    if cap:
+        parts = [g.sample(min(len(g), cap), random_state=seed)
+                 for _, g in d.groupby(['original_id', 'stage'])]
+        d = pd.concat(parts)
+    d = d.reset_index(drop=True)
+    y = d['stage'].map({st: i for i, st in enumerate(stage_order)}).values
+    return d[feat_cols].values, y, d['original_id'].values
+
+
+def run_fold(tr, te, x, y, groups, seed, inner_folds):
+    n_feat = x.shape[1]
+    n_grid = sorted({k for k in (2, 3, 4, 6, 8, 12, 16, 20, 25) if k < n_feat} | {n_feat})
+    x_tr_all, y_tr_all, g_tr_all = x[tr], y[tr], groups[tr]
+
+    # Inner CV: one RFE ranking per inner fold, reused for every n and every C
+    inner = StratifiedGroupKFold(inner_folds, shuffle=True, random_state=seed)
+    scores = np.full((inner_folds, len(n_grid), len(c_grid)), np.nan)
+    for k, (ia, ib) in enumerate(inner.split(x_tr_all, y_tr_all, g_tr_all)):
+        ya, yb = y_tr_all[ia], y_tr_all[ib]
+        if len(np.unique(ya)) < len(stage_order) or len(np.unique(yb)) < 2:
+            continue
+        xa, xb = impute_scale(x_tr_all[ia], x_tr_all[ib])
+        wa = compute_sample_weight('balanced', ya)
+        rank = rfe_rank(xa, ya, wa)
+        for i, n in enumerate(n_grid):
+            cols = rank <= n
+            for j, c in enumerate(c_grid):
+                model = OrdinalLogit(c).fit(xa[:, cols], ya, wa)
+                scores[k, i, j] = spearmanr(model.decision_function(xb[:, cols]), yb)[0]
+
+    mean_scores = np.nanmean(scores, axis=0)
+    i, j = np.unravel_index(np.nanargmax(mean_scores), mean_scores.shape)
+    best_n, best_c = n_grid[i], c_grid[j]
+
+    # Final model on all outer-training data
+    x_tr, x_te = impute_scale(x_tr_all, x[te])
+    w = compute_sample_weight('balanced', y_tr_all)
+    cols = rfe_rank(x_tr, y_tr_all, w) <= best_n
+    model = OrdinalLogit(best_c).fit(x_tr[:, cols], y_tr_all, w)
+
+    yt = y[te]
+    z = model.decision_function(x_te[:, cols])
+    pred = model.predict(x_te[:, cols])
+
+    out = dict(rho=spearmanr(z, yt)[0],
+               ba=balanced_accuracy_score(yt, pred),
+               mae=float(np.mean(np.abs(pred - yt))),
+               n_feat=int(cols.sum()), c=best_c)
+    for a, b in ((0, 1), (1, 2), (0, 2)):
+        mask = np.isin(yt, [a, b])
+        out[f'auc_{stage_order[a]}_vs_{stage_order[b]}'] = (
+            roc_auc_score(yt[mask] == b, z[mask]) if len(np.unique(yt[mask])) == 2 else np.nan)
+    coef_full = np.zeros(n_feat)
+    coef_full[cols] = model.coef_
+    out['coef'] = coef_full
+    return out
+
+def nested_cv(x, y, groups, s, bar):
+    fold_results = []
+    for r in range(s['repeats']):
+        seed = s['seed'] + r
+        outer = StratifiedGroupKFold(s['outer_folds'], shuffle=True, random_state=seed)
+        jobs = [delayed(run_fold)(tr, te, x, y, groups, seed, s['inner_folds'])
+                for tr, te in outer.split(x, y, groups)]
+        for d in run_jobs(jobs, s['n_jobs'], bar):
+            d['repeat'] = r
+            fold_results.append(d)
+    return fold_results
+
+def summarise(fold_results, feat_cols):
+    metrics = [k for k in fold_results[0] if k not in ('coef', 'repeat')]
+    df = pd.DataFrame([{k: d[k] for k in metrics + ['repeat']} for d in fold_results])
+    per_repeat = df.groupby('repeat')[metrics].mean()
+
+    coefs = np.vstack([d['coef'] for d in fold_results])
+    selected = coefs != 0
+    n_sel = selected.sum(axis=0)
+    pos = (coefs > 0).sum(axis=0)
+    neg = (coefs < 0).sum(axis=0)
+    importance = pd.DataFrame({
+        'selection_freq': selected.mean(axis=0),
+        'mean_coef': coefs.mean(axis=0),            # Zeros where not selected
+        'sd_coef': coefs.std(axis=0),
+        'sign_consistency': np.where(n_sel > 0, np.maximum(pos, neg) / np.maximum(n_sel, 1), np.nan),
+        'mean_abs_coef': np.abs(coefs).mean(axis=0),
+    }, index=feat_cols).sort_values('mean_abs_coef', ascending=False)
+
+    parts = pd.DataFrame([n.split('_', 2) for n in importance.index],
+                         columns=['prefix', 'band', 'region'], index=importance.index)
+    by_band = importance['mean_abs_coef'].groupby(parts['band']).sum()
+    by_region = importance['mean_abs_coef'].groupby(parts['region']).sum()
+    return per_repeat, importance, (by_band / by_band.sum()).sort_values(ascending=False), \
+        (by_region / by_region.sum()).sort_values(ascending=False)
+
 def channel_region(name):
     """'Fp1' -> 'Frontal', 'T8' -> 'Temporal_R', 'M1' -> None (excluded)."""
     m = re.match(r'^(.{1,2})(.)$', name)
@@ -101,47 +268,6 @@ def rfe_rank(x, y, seed):
     return RFE(make_lr(seed), n_features_to_select=1, step=1).fit(x, y).ranking_
 
 
-def run_fold(tr, te, x, y, groups, feat_cols, seed, inner_folds):
-    n_feat = x.shape[1]
-    n_grid = sorted({k for k in (2, 3, 4, 6, 8, 12, 16, 20, 25) if k < n_feat} | {n_feat})
-    x_tr_all, y_tr_all, g_tr_all = x[tr], y[tr], groups[tr]
-
-    # Inner CV: one RFE ranking per inner fold, reused for every n and every C
-    inner = StratifiedGroupKFold(inner_folds, shuffle=True, random_state=seed)
-    scores = np.full((inner_folds, len(n_grid), len(c_grid)), np.nan)
-    for k, (ia, ib) in enumerate(inner.split(x_tr_all, y_tr_all, g_tr_all)):
-        ya, yb = y_tr_all[ia], y_tr_all[ib]
-        if len(np.unique(yb)) < 2:
-            continue                                # AUC undefined for this inner fold
-        xa, xb = impute_scale(x_tr_all[ia], x_tr_all[ib])
-        rank = rfe_rank(xa, ya, seed)
-        for i, n in enumerate(n_grid):
-            cols = rank <= n
-            for j, c in enumerate(c_grid):
-                clf = make_lr(seed, c).fit(xa[:, cols], ya)
-                scores[k, i, j] = roc_auc_score(yb, clf.predict_proba(xb[:, cols])[:, 1])
-
-    mean_scores = np.nanmean(scores, axis=0)
-    i, j = np.unravel_index(np.nanargmax(mean_scores), mean_scores.shape)
-    best_n, best_c = n_grid[i], c_grid[j]
-
-    # Final model on all outer-training data
-    x_tr, x_te = impute_scale(x_tr_all, x[te])
-    cols = rfe_rank(x_tr, y_tr_all, seed) <= best_n
-    clf = make_lr(seed, best_c).fit(x_tr[:, cols], y_tr_all)
-
-    prob = clf.predict_proba(x_te[:, cols])[:, 1]
-    pred = clf.predict(x_te[:, cols])
-    return dict(
-        te=te, prob=prob, pred=pred,
-        auc=roc_auc_score(y[te], prob) if len(np.unique(y[te])) == 2 else np.nan,
-        ba=balanced_accuracy_score(y[te], pred),
-        features=list(np.array(feat_cols)[cols]),
-        coefs=list(clf.coef_[0]),
-        n_feat=int(cols.sum()), c=best_c,
-    )
-
-
 def run_jobs(jobs, n_jobs, bar):
     """Run the delayed fold jobs on one or several cores, updating the progress bar per fold."""
     results = []
@@ -155,38 +281,6 @@ def run_jobs(jobs, n_jobs, bar):
             bar.update(1)
     return results
 
-
-def nested_cv(x, y, groups, feat_cols, s, bar):
-    per_auc, per_ba, pooled_auc, pooled_ba = [], [], [], []
-    feature_hits, n_sel, cs = {}, [], []
-    n_folds_total = 0
-
-    for r in range(s['repeats']):
-        seed = s['seed'] + r
-        outer = StratifiedGroupKFold(s['outer_folds'], shuffle=True, random_state=seed)
-        jobs = [delayed(run_fold)(tr, te, x, y, groups, feat_cols, seed, s['inner_folds'])
-                for tr, te in outer.split(x, y, groups)]
-        res = run_jobs(jobs, s['n_jobs'], bar)
-
-        oof_p, oof_pred = np.full(len(y), np.nan), np.full(len(y), -1)
-        for d in res:
-            oof_p[d['te']], oof_pred[d['te']] = d['prob'], d['pred']
-            for f in d['features']:
-                feature_hits[f] = feature_hits.get(f, 0) + 1
-            n_sel.append(d['n_feat'])
-            cs.append(d['c'])
-            n_folds_total += 1
-
-        per_auc.append(np.nanmean([d['auc'] for d in res]))
-        per_ba.append(np.mean([d['ba'] for d in res]))
-        pooled_auc.append(roc_auc_score(y, oof_p))
-        pooled_ba.append(balanced_accuracy_score(y, oof_pred))
-
-    stab = (pd.Series(feature_hits, dtype=float) / n_folds_total).sort_values(ascending=False)
-    return dict(per_repeat_fold_mean_auc=per_auc, per_repeat_fold_mean_ba=per_ba,
-                per_repeat_pooled_auc=pooled_auc, per_repeat_pooled_ba=pooled_ba,
-                feature_selection_frequency=stab,
-                median_n_features=float(np.median(n_sel)), median_c=float(np.median(cs)))
 
 #%%
 load_folder = r'D:\Sleep_data\Preprocessing\Clean_final'
@@ -395,188 +489,6 @@ stage_order = ['W', 'N1', 'N2', 'N3']         # Decreasing E/I ratio
 c_grid = np.logspace(-3, 1, 5)
 
 
-class OrdinalLogit:
-    """Proportional-odds logistic regression with an L2 penalty.
-
-    Objective: mean weighted negative log-likelihood + ||w||^2 / (2 * c * n),
-    so c has the same meaning as C in sklearn's LogisticRegression.
-    """
-
-    def __init__(self, c=1.0, max_iter=500):
-        self.c = c
-        self.max_iter = max_iter
-
-    @staticmethod
-    def _unpack(params, p):
-        # Thresholds are kept increasing: theta_0 = a0, theta_k = theta_(k-1) + exp(d_k)
-        w, a0, d = params[:p], params[p], params[p + 1:]
-        return w, np.cumsum(np.concatenate([[a0], np.exp(d)]))
-
-    def _objective(self, params, x, y, s):
-        n, p = x.shape
-        w, theta = self._unpack(params, p)
-        d = params[p + 1:]
-        idx = np.arange(n)
-
-        f = expit(theta[None, :] - (x @ w)[:, None])                  # n x (K-1), F_k
-        fcum = np.hstack([np.zeros((n, 1)), f, np.ones((n, 1))])      # Columns: F_-1 ... F_(K-1)
-        prob = np.clip(fcum[idx, y + 1] - fcum[idx, y], 1e-12, None)  # P(y) = F_y - F_(y-1)
-
-        value = -np.mean(s * np.log(prob)) + w @ w / (2 * self.c * n)
-
-        g = f * (1 - f)                                               # dF_k / dtheta_k
-        gcum = np.hstack([np.zeros((n, 1)), g, np.zeros((n, 1))])
-        r = s / (prob * n)
-        grad_w = x.T @ (r * (gcum[idx, y + 1] - gcum[idx, y])) + w / (self.c * n)
-
-        k = f.shape[1]
-        grad_theta = np.array([-(np.sum(r[y == j] * g[y == j, j])
-                                 - np.sum(r[y == j + 1] * g[y == j + 1, j])) for j in range(k)])
-        rev = np.cumsum(grad_theta[::-1])[::-1]                       # rev[j] = sum of grad_theta[k >= j]
-        grad = np.concatenate([grad_w, [rev[0]], np.exp(d) * rev[1:]])
-        return value, grad
-
-    def fit(self, x, y, sample_weight=None):
-        self.classes_ = np.unique(y)
-        y = np.searchsorted(self.classes_, y)
-        n, p = x.shape
-        k = len(self.classes_)
-        s = np.ones(n) if sample_weight is None else sample_weight * n / np.sum(sample_weight)
-
-        # Start from the (weighted) class proportions
-        props = np.array([s[y == j].sum() for j in range(k)]) / s.sum()
-        cum = np.clip(np.cumsum(props)[:-1], 1e-3, 1 - 1e-3)
-        theta0 = np.log(cum / (1 - cum))
-        init = np.concatenate([np.zeros(p), [theta0[0]],
-                               np.log(np.clip(np.diff(theta0), 1e-3, None))])
-
-        res = minimize(self._objective, init, args=(x, y, s), jac=True,
-                       method='L-BFGS-B', options={'maxiter': self.max_iter})
-        self.coef_, self.theta_ = self._unpack(res.x, p)
-        return self
-
-    def decision_function(self, x):
-        return x @ self.coef_
-
-    def predict_proba(self, x):
-        f = expit(self.theta_[None, :] - self.decision_function(x)[:, None])
-        n = len(f)
-        return np.diff(np.hstack([np.zeros((n, 1)), f, np.ones((n, 1))]), axis=1)
-
-    def predict(self, x):
-        return self.classes_[np.argmax(self.predict_proba(x), axis=1)]
-
-
-def rfe_rank(x, y, w):
-    """RFE ranking (1 = most important): repeatedly drop the feature with the smallest |coef|.
-    The top n features are those with rank <= n."""
-    remaining = list(range(x.shape[1]))
-    rank = np.zeros(x.shape[1], dtype=int)
-    while len(remaining) > 1:
-        model = OrdinalLogit(c=1.0).fit(x[:, remaining], y, w)
-        worst = int(np.argmin(np.abs(model.coef_)))
-        rank[remaining.pop(worst)] = len(remaining) + 1
-    rank[remaining[0]] = 1
-    return rank
-
-
-def make_set(df, feat_cols, cap, seed):
-    d = df[df['stage'].isin(stage_order)]
-    if cap:
-        parts = [g.sample(min(len(g), cap), random_state=seed)
-                 for _, g in d.groupby(['original_id', 'stage'])]
-        d = pd.concat(parts)
-    d = d.reset_index(drop=True)
-    y = d['stage'].map({st: i for i, st in enumerate(stage_order)}).values
-    return d[feat_cols].values, y, d['original_id'].values
-
-
-def run_fold(tr, te, x, y, groups, seed, inner_folds):
-    n_feat = x.shape[1]
-    n_grid = sorted({k for k in (2, 3, 4, 6, 8, 12, 16, 20, 25) if k < n_feat} | {n_feat})
-    x_tr_all, y_tr_all, g_tr_all = x[tr], y[tr], groups[tr]
-
-    # Inner CV: one RFE ranking per inner fold, reused for every n and every C
-    inner = StratifiedGroupKFold(inner_folds, shuffle=True, random_state=seed)
-    scores = np.full((inner_folds, len(n_grid), len(c_grid)), np.nan)
-    for k, (ia, ib) in enumerate(inner.split(x_tr_all, y_tr_all, g_tr_all)):
-        ya, yb = y_tr_all[ia], y_tr_all[ib]
-        if len(np.unique(ya)) < len(stage_order) or len(np.unique(yb)) < 2:
-            continue
-        xa, xb = impute_scale(x_tr_all[ia], x_tr_all[ib])
-        wa = compute_sample_weight('balanced', ya)
-        rank = rfe_rank(xa, ya, wa)
-        for i, n in enumerate(n_grid):
-            cols = rank <= n
-            for j, c in enumerate(c_grid):
-                model = OrdinalLogit(c).fit(xa[:, cols], ya, wa)
-                scores[k, i, j] = spearmanr(model.decision_function(xb[:, cols]), yb)[0]
-
-    mean_scores = np.nanmean(scores, axis=0)
-    i, j = np.unravel_index(np.nanargmax(mean_scores), mean_scores.shape)
-    best_n, best_c = n_grid[i], c_grid[j]
-
-    # Final model on all outer-training data
-    x_tr, x_te = impute_scale(x_tr_all, x[te])
-    w = compute_sample_weight('balanced', y_tr_all)
-    cols = rfe_rank(x_tr, y_tr_all, w) <= best_n
-    model = OrdinalLogit(best_c).fit(x_tr[:, cols], y_tr_all, w)
-
-    yt = y[te]
-    z = model.decision_function(x_te[:, cols])
-    pred = model.predict(x_te[:, cols])
-
-    out = dict(rho=spearmanr(z, yt)[0],
-               ba=balanced_accuracy_score(yt, pred),
-               mae=float(np.mean(np.abs(pred - yt))),
-               n_feat=int(cols.sum()), c=best_c)
-    for a, b in ((0, 1), (1, 2), (0, 2)):
-        mask = np.isin(yt, [a, b])
-        out[f'auc_{stage_order[a]}_vs_{stage_order[b]}'] = (
-            roc_auc_score(yt[mask] == b, z[mask]) if len(np.unique(yt[mask])) == 2 else np.nan)
-    coef_full = np.zeros(n_feat)
-    coef_full[cols] = model.coef_
-    out['coef'] = coef_full
-    return out
-
-
-def nested_cv(x, y, groups, s, bar):
-    fold_results = []
-    for r in range(s['repeats']):
-        seed = s['seed'] + r
-        outer = StratifiedGroupKFold(s['outer_folds'], shuffle=True, random_state=seed)
-        jobs = [delayed(run_fold)(tr, te, x, y, groups, seed, s['inner_folds'])
-                for tr, te in outer.split(x, y, groups)]
-        for d in run_jobs(jobs, s['n_jobs'], bar):
-            d['repeat'] = r
-            fold_results.append(d)
-    return fold_results
-
-
-def summarise(fold_results, feat_cols):
-    metrics = [k for k in fold_results[0] if k not in ('coef', 'repeat')]
-    df = pd.DataFrame([{k: d[k] for k in metrics + ['repeat']} for d in fold_results])
-    per_repeat = df.groupby('repeat')[metrics].mean()
-
-    coefs = np.vstack([d['coef'] for d in fold_results])
-    selected = coefs != 0
-    n_sel = selected.sum(axis=0)
-    pos = (coefs > 0).sum(axis=0)
-    neg = (coefs < 0).sum(axis=0)
-    importance = pd.DataFrame({
-        'selection_freq': selected.mean(axis=0),
-        'mean_coef': coefs.mean(axis=0),            # Zeros where not selected
-        'sd_coef': coefs.std(axis=0),
-        'sign_consistency': np.where(n_sel > 0, np.maximum(pos, neg) / np.maximum(n_sel, 1), np.nan),
-        'mean_abs_coef': np.abs(coefs).mean(axis=0),
-    }, index=feat_cols).sort_values('mean_abs_coef', ascending=False)
-
-    parts = pd.DataFrame([n.split('_', 2) for n in importance.index],
-                         columns=['prefix', 'band', 'region'], index=importance.index)
-    by_band = importance['mean_abs_coef'].groupby(parts['band']).sum()
-    by_region = importance['mean_abs_coef'].groupby(parts['region']).sum()
-    return per_repeat, importance, (by_band / by_band.sum()).sort_values(ascending=False), \
-        (by_region / by_region.sum()).sort_values(ascending=False)
 
 
 s = settings
